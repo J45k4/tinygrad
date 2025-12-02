@@ -1,9 +1,11 @@
+import time
 from typing import cast
-from dataclasses import dataclass, field
-from collections import deque, defaultdict
-from tinygrad.uop.ops import UOp, Variable, Ops, UPat, PatternMatcher, graph_rewrite, buffers
+from dataclasses import dataclass, field, replace
+from collections import deque
+from tinygrad.uop.ops import UOp, Ops, buffers, UOpMetaClass
+from tinygrad.uop.spec import type_verify, tensor_spec
 from tinygrad.device import Buffer, MultiBuffer
-from tinygrad.helpers import Metadata, unwrap, merge_dicts
+from tinygrad.helpers import Metadata, DEBUG, cpu_profile, TracingKey, SPEC, flatten
 
 # **** ScheduleItem return type
 
@@ -12,86 +14,130 @@ class ScheduleItem:
   ast: UOp
   bufs: tuple[Buffer, ...]
   metadata: tuple[Metadata, ...] = ()
-  fixedvars: dict[Variable, int] = field(default_factory=dict)
-
-# **** unbind Variables
-
-def unbind_view(ctx:list[dict[Variable, int]], x:UOp):
-  st = unwrap(x.st).simplify()
-  if any(x.op is Ops.BIND for x in st.vars()):
-    st, var_vals = st.unbind()
-    ctx.append(var_vals)
-  return x.replace(arg=st) if st != x.st else None
-
-def unbind_bind(ctx:list[dict[Variable, int]], x:UOp):
-  var, val = x.unbind()
-  ctx.append({var.replace(src=()):val})
-  return var
-
-pm_unbind = PatternMatcher([
-  (UPat(Ops.VIEW, name="x"), unbind_view),
-  (UPat(Ops.BIND, name="x"), unbind_bind),
-])
+  fixedvars: dict[str, int] = field(default_factory=dict)
+  bound_ranges: tuple[UOp, ...] = ()
 
 # **** schedule linearizer
 
-def create_schedule_with_vars(sched_sink:UOp) -> tuple[list[ScheduleItem], dict[Variable, int], dict[UOp, UOp]]:
-  # construct the KERNEL children graph based on assigns
-  children: defaultdict[UOp, list[UOp]] = defaultdict(list)
-  in_degree: dict[UOp, int] = {}
-  for u in (toposort:=sched_sink.toposort()):
-    if u.op is not Ops.ASSIGN: continue
-    k = u.src[1]
-    in_degree.setdefault(k, 0)
-    for s in k.src:
-      if s.op is not Ops.ASSIGN: continue
-      children[s.src[1]].append(k)
-      in_degree[k] += 1
-
-  # linearize KERNEL UOps into ScheduleItems in BFS order
-  queue = deque(k for k,v in in_degree.items() if v == 0)
-  schedule: list[ScheduleItem] = []
-  var_vals: dict[Variable, int] = {}
-  while queue:
-    k = queue.popleft()
-    # unbind var_vals from the kernel
-    local_var_vals: list[dict[Variable, int]] = []
-    ast = graph_rewrite(k.arg.ast, pm_unbind, ctx=local_var_vals, name="unbind vars")
-    var_vals = merge_dicts([var_vals, *local_var_vals])
-    # create subbuffers if needed
-    if ast.op is Ops.BUFFER_VIEW:
-      base = k.src[1].buf_uop.buffer
-      assert isinstance(base, Buffer), "base can't be MultiBuffer"
-      buffers[k.src[0]] = base.view(k.size, ast.dtype, ast.arg[1]*base.dtype.itemsize)
-    ubufs = tuple(s.buf_uop.buffer for s in k.src)
-    if any(isinstance(x, MultiBuffer) for x in ubufs):
-      if ast.op is Ops.COPY:
-        if isinstance(ubufs[1], MultiBuffer) and ast.arg is None:  # src is multiple buffers, none selected
-          if isinstance(ubufs[0], MultiBuffer):
-            # COPY ALL -> ALL
-            for b1,b2 in zip(ubufs[0].bufs, ubufs[1].bufs): schedule.append(ScheduleItem(ast, (b1, b2), k.arg.metadata))
-          else:
-            # COPY ANY -> ONE. Currently we just select the first
-            schedule.append(ScheduleItem(ast, (ubufs[0], ubufs[1].bufs[0]), k.arg.metadata))
+def create_schedule_with_vars(sched_sink:UOp) -> tuple[list[ScheduleItem], dict[str, int]]:
+  with cpu_profile(TracingKey("toposort sched_sink")):
+    # construct the KERNEL children graph based on assigns
+    children: dict[UOp, list[UOp]] = {}
+    in_degree: dict[UOp, int] = {}
+    var_vals: dict[str, int] = {}
+    for u in sched_sink.toposort():
+      if u.op is Ops.RANGE:
+        in_degree.setdefault(u, 0)
+        continue
+      if u.op is not Ops.AFTER or u.src[1].op is Ops.RANGE: continue
+      k = u.src[1]
+      in_degree.setdefault(k, 0)
+      for s in k.src[0].src if k.op is Ops.END else k.src:
+        if s.op is Ops.AFTER:
+          children.setdefault(s.src[1], []).append(k)
+          in_degree[k] += 1
+        elif s.op in {Ops.MSELECT, Ops.MSTACK}:
+          for ss in s.src:
+            if ss.op is Ops.MSELECT: ss = ss.src[0]
+            if ss.op is not Ops.BUFFER:
+              assert ss.op is Ops.AFTER, f"ss.op is not AFTER, it's {ss.op}"
+              children.setdefault(ss.src[1], []).append(k)
+              in_degree[k] += 1
+        elif s.op is Ops.BUFFER:
+          pass  # a BUFFER is already realized, nothing to do here
+        elif s.op is Ops.BIND:
+          # for RANGE this is in fixedvars
+          if s.src[1].op is not Ops.RANGE:
+            var, val = s.unbind()
+            assert var.expr not in var_vals or var_vals[var.expr] == val, f"bind mismatch on {var}, {var_vals[var.expr]} != {val}"
+            var_vals[var.expr] = val
         else:
-          src_buf = ubufs[1].bufs[ast.arg] if isinstance(ubufs[1], MultiBuffer) else ubufs[1]
-          if isinstance(ubufs[0], MultiBuffer):
-            # COPY ONE -> ALL (BROADCAST)
-            for b in ubufs[0].bufs: schedule.append(ScheduleItem(ast, (b, src_buf), k.arg.metadata))
-          else: schedule.append(ScheduleItem(ast, (ubufs[0], src_buf), k.arg.metadata)) # COPY ONE -> ONE
+          raise RuntimeError(f"input to kernel must be AFTER or BUFFER, not {s.op}")
+
+  with cpu_profile(TracingKey("linearize to ScheduleItem")):
+    queue: deque[UOp] = deque()
+    for k,v in in_degree.items():
+      if v == 0: queue.append(k)
+
+    schedule: list[ScheduleItem|UOp] = []
+    while len(queue):
+      k = rk = queue.popleft()
+      if k.op is Ops.END: k = k.src[0]
+      if k.op is Ops.RANGE: schedule.append(k)
+      elif k.op is Ops.KERNEL:
+        ast = k.arg.ast
+        # create subbuffers if needed
+        if ast.op is Ops.BUFFER_VIEW:
+          base = k.src[1].buf_uop.buffer
+          assert isinstance(base, Buffer), "base can't be MultiBuffer"
+          buffers[k.src[0]] = base.view(k.size, ast.dtype, ast.arg[1]*base.dtype.itemsize)
+        ubufs = tuple(s.buf_uop.buffer for s in k.src if s.op is not Ops.BIND)
+        bound_ranges = tuple(s for s in k.src if s.op is Ops.BIND and s.src[1].op is Ops.RANGE)
+        if any(isinstance(x, MultiBuffer) for x in ubufs):
+          assert all(isinstance(x, MultiBuffer) for x in ubufs), "kernel must all be multibuffer"
+          dnums = [x for x in ast.variables() if x.arg[0] == '_device_num']
+          for i,bufs in enumerate(zip(*[x.bufs for x in cast(tuple[MultiBuffer, ...], ubufs)])):
+            schedule.append(ScheduleItem(ast, bufs, k.arg.metadata, {dnums[0].expr:i} if len(dnums) else {}, bound_ranges=bound_ranges))
+        else:
+          # ONE -> ONE
+          schedule.append(ScheduleItem(ast, cast(tuple[Buffer, ...], ubufs), k.arg.metadata, bound_ranges=bound_ranges))
+        if rk.op is Ops.END: schedule.append(rk)
       else:
-        assert all(isinstance(x, MultiBuffer) for x in ubufs), "kernel must all be multibuffer"
-        dnums = [x for x in ast.variables() if x.arg[0] == '_device_num']
-        for i,bufs in enumerate(zip(*[x.bufs for x in cast(tuple[MultiBuffer, ...], ubufs)])):
-          schedule.append(ScheduleItem(ast, bufs, k.arg.metadata, {dnums[0]:i} if len(dnums) else {}))
-    else:
-      schedule.append(ScheduleItem(ast, cast(tuple[Buffer, ...], ubufs), k.arg.metadata))
-    for x in children[k]:
-      in_degree[x] -= 1
-      if in_degree[x] == 0: queue.append(x)
+        raise RuntimeError(f"can't schedule {k.op}")
+      for x in children.get(rk, []):
+        in_degree[x] -= 1
+        if in_degree[x] == 0: queue.append(x)
 
-  # map ASSIGN to BUFFER after ScheduleItems are constructed
-  becomes_map = {u:u.buf_uop for u in toposort if u.op is Ops.ASSIGN}
-  assert all(u.op in {Ops.BUFFER, Ops.BUFFER_VIEW} for u in becomes_map.values()), f"Schedule didn't end with BUFFER {becomes_map.values()}"
+  with cpu_profile(TracingKey("expand ranges")):
+    real_schedule: list[ScheduleItem] = []
+    sched_ptr = 0
+    in_ranges = {}
+    range_ptrs = {}
+    while sched_ptr < len(schedule):
+      si = schedule[sched_ptr]
+      if isinstance(si, UOp):
+        if si.op is Ops.RANGE:
+          in_ranges[si] = 0
+          range_ptrs[si] = sched_ptr + 1
+        elif si.op is Ops.END:
+          if in_ranges[si.src[1]] < si.src[1].vmax:
+            in_ranges[si.src[1]] += 1
+            sched_ptr = range_ptrs[si.src[1]]
+            continue
+      else:
+        real_schedule.append(replace(si, fixedvars=si.fixedvars | {s.src[0].arg[0]:in_ranges[s.src[1]] for s in si.bound_ranges}, bound_ranges=()))
+      sched_ptr += 1
+  return real_schedule, var_vals
 
-  return schedule, var_vals, becomes_map
+from tinygrad.engine.memory import memory_planner
+from tinygrad.schedule.rangeify import get_rangeify_map
+from tinygrad.schedule.multi import get_multi_map
+
+def complete_create_schedule_with_vars(big_sink:UOp) -> tuple[dict[UOp, UOp], list[ScheduleItem], dict[str, int]]:
+  # big_sink srcs are all the Tensors
+  st = time.perf_counter()
+
+  # verify Tensors match the spec
+  if SPEC: type_verify(big_sink, tensor_spec)
+
+  # tensor map is what we return
+  tensor_map: dict[UOp, UOp] = {}
+
+  if any(isinstance(x._device, tuple) for x in big_sink.toposort()):
+    tensor_map |= get_multi_map(big_sink)
+    big_sink = big_sink.substitute(tensor_map, name="Apply Multi Map")
+    big_sink = UOp.sink(*flatten([x.src if x.op is Ops.MULTI else [x] for x in big_sink.src]))
+
+  tensor_map |= get_rangeify_map(big_sink)
+  big_sink = big_sink.substitute(tensor_map, name="Apply Kernelize Map")
+
+  # create the schedule
+  schedule, var_vals = create_schedule_with_vars(big_sink)
+  with cpu_profile(TracingKey("memory planner")): schedule = memory_planner(schedule)
+
+  # remove all AFTERs, after scheduling, the tensors are just buffers
+  tensor_map |= {u:u.buf_uop for u in big_sink.toposort() if u.op is Ops.AFTER}
+
+  if (DEBUG >= 1 and len(schedule) > 1) or DEBUG >= 3:
+    print(f"scheduled {len(schedule)} kernels in {(time.perf_counter()-st)*1000:.2f} ms ({len(UOpMetaClass.ucache)} uops in cache)")
+  return tensor_map, schedule, var_vals

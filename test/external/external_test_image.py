@@ -4,11 +4,10 @@ import unittest
 import numpy as np
 if 'IMAGE' not in os.environ:
   os.environ['IMAGE'] = '2'
-os.environ['GPU'] = '1'
+os.environ['CL'] = '1'
 os.environ['OPT'] = '2'
 from tinygrad.tensor import Tensor
 from tinygrad.nn import Conv2d
-Tensor.no_grad = True
 
 class TestImage(unittest.TestCase):
   def test_create_image(self):

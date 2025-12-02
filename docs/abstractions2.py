@@ -7,28 +7,30 @@
 
 print("******** first, the runtime ***********")
 
-from tinygrad.runtime.ops_cpu import ClangJITCompiler, MallocAllocator, CPUProgram
+from tinygrad.runtime.ops_cpu import ClangJITCompiler, CPUDevice, CPUProgram
+
+cpu = CPUDevice()
 
 # allocate some buffers
-out = MallocAllocator.alloc(4)
-a = MallocAllocator.alloc(4)
-b = MallocAllocator.alloc(4)
+out = cpu.allocator.alloc(4)
+a = cpu.allocator.alloc(4)
+b = cpu.allocator.alloc(4)
 
 # load in some values (little endian)
-MallocAllocator._copyin(a, memoryview(bytearray([2,0,0,0])))
-MallocAllocator._copyin(b, memoryview(bytearray([3,0,0,0])))
+cpu.allocator._copyin(a, memoryview(bytearray([2,0,0,0])))
+cpu.allocator._copyin(b, memoryview(bytearray([3,0,0,0])))
 
 # compile a program to a binary
 lib = ClangJITCompiler().compile("void add(int *out, int *a, int *b) { out[0] = a[0] + b[0]; }")
 
 # create a runtime for the program
-fxn = CPUProgram("add", lib)
+fxn = cpu.runtime("add", lib)
 
 # run the program
 fxn(out, a, b)
 
 # check the data out
-print(val := MallocAllocator._as_buffer(out).cast("I").tolist()[0])
+print(val := cpu.allocator._as_buffer(out).cast("I").tolist()[0])
 assert val == 5
 
 
@@ -40,30 +42,28 @@ import struct
 from tinygrad.dtype import dtypes
 from tinygrad.device import Buffer, Device
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.shape.shapetracker import ShapeTracker
 
 # allocate some buffers + load in values
 out = Buffer(DEVICE, 1, dtypes.int32).allocate()
 a = Buffer(DEVICE, 1, dtypes.int32).allocate().copyin(memoryview(bytearray(struct.pack("I", 2))))
 b = Buffer(DEVICE, 1, dtypes.int32).allocate().copyin(memoryview(bytearray(struct.pack("I", 3))))
-# NOTE: a._buf is the same as the return from MallocAllocator.alloc
+# NOTE: a._buf is the same as the return from cpu.allocator.alloc
 
 # describe the computation
+idx = UOp.const(dtypes.index, 0)
 buf_1 = UOp(Ops.DEFINE_GLOBAL, dtypes.int32.ptr(), (), 1)
 buf_2 = UOp(Ops.DEFINE_GLOBAL, dtypes.int32.ptr(), (), 2)
-ld_1 = UOp(Ops.LOAD, dtypes.int32, (buf_1, ShapeTracker.from_shape((1,)).to_uop()))
-ld_2 = UOp(Ops.LOAD, dtypes.int32, (buf_2, ShapeTracker.from_shape((1,)).to_uop()))
-alu = ld_1 + ld_2
+alu = buf_1.index(idx) + buf_2.index(idx)
 output_buf = UOp(Ops.DEFINE_GLOBAL, dtypes.int32.ptr(), (), 0)
-st_0 = UOp(Ops.STORE, dtypes.void, (output_buf, ShapeTracker.from_shape((1,)).to_uop(), alu))
+st_0 = UOp(Ops.STORE, dtypes.void, (output_buf.index(idx), alu))
 s = UOp(Ops.SINK, dtypes.void, (st_0,))
 
 # convert the computation to a "linearized" format (print the format)
-from tinygrad.engine.realize import get_kernel, CompiledRunner
-kernel = get_kernel(Device[DEVICE].renderer, s).linearize()
+from tinygrad.engine.realize import get_program, CompiledRunner
+program = get_program(s, Device[DEVICE].renderer)
 
 # compile a program (and print the source)
-fxn = CompiledRunner(kernel.to_program())
+fxn = CompiledRunner(program)
 print(fxn.p.src)
 # NOTE: fxn.clprg is the CPUProgram
 
@@ -78,7 +78,7 @@ print("******** third, the UOp ***********")
 
 from tinygrad.engine.realize import run_schedule
 from tinygrad.engine.schedule import create_schedule_with_vars
-from tinygrad.engine.grouper import get_becomes_map
+from tinygrad.schedule.rangeify import get_rangeify_map
 
 # allocate some values + load in values
 a = UOp.new_buffer(DEVICE, 1, dtypes.int32)
@@ -91,10 +91,10 @@ out = a + b
 s = UOp(Ops.SINK, dtypes.void, (out,))
 
 # group the computation into kernels
-becomes_map = get_becomes_map(s)
+becomes_map = get_rangeify_map(s)
 
 # the compute maps to an assign
-assign = becomes_map[a+b]
+assign = becomes_map[a+b].base
 
 # the first source is the output buffer (data)
 assert assign.src[0].op is Ops.BUFFER
@@ -103,7 +103,7 @@ assert assign.src[1].op is Ops.KERNEL
 
 # schedule the kernel graph in a linear list
 s = UOp(Ops.SINK, dtypes.void, (assign,))
-sched, _, becomes_map = create_schedule_with_vars(s)
+sched, _ = create_schedule_with_vars(s)
 assert len(sched) == 1
 
 # DEBUGGING: print the compute ast
@@ -111,7 +111,7 @@ print(sched[-1].ast)
 # NOTE: sched[-1].ast is the same as st_0 above
 
 # the output will be stored in a new buffer
-out = becomes_map[assign]
+out = assign.buf_uop
 assert out.op is Ops.BUFFER and not out.buffer.is_allocated()
 print(out)
 
