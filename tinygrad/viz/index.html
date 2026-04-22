@@ -11,7 +11,6 @@
   <script src="assets/cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
   <script src="assets/cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/languages/python.min.js"></script>
   <script src="assets/cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/languages/cpp.min.js"></script>
-  <script src="assets/cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/languages/x86asm.min.js"></script>
   <link rel="stylesheet" href="assets/unpkg.com/@highlightjs/cdn-assets@11.10.0/styles/tokyo-night-dark.min.css" />
   <style>
   * {
@@ -77,7 +76,7 @@
     pointer-events: none;
   }
   label {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     gap: 4px;
     line-height: 1;
@@ -103,6 +102,14 @@
     fill: #FFD700;
     stroke: #B8860B;
   }
+  g.tag.collapsed circle {
+    fill: #5CD68D;
+    stroke: #4a4b57;
+  }
+  g.tag.expanded circle {
+    fill: #9FDDE6;
+    stroke: #4a4b57;
+  }
   g.port circle {
     fill: #b3dcc2;
   }
@@ -110,6 +117,7 @@
     stroke-width: 0.8;
   }
   g.tag text, #edge-labels text {
+    font-family: monospace;
     text-anchor: middle;
     font-size: 6px;
     fill: #08090e;
@@ -125,14 +133,36 @@
     fill: rgba(26, 27, 38, 0.5);
   }
   .edgePath {
-    stroke: #4a4b57;
     fill: none;
     stroke-width: 1.4px;
   }
-  g.node.highlight rect, .edgePath.highlight, g.port circle {
+  g.label rect.bg {
+    fill: transparent;
+    stroke: none;
+  }
+  g.label rect.bg.highlight {
+    fill: #5f0059;
+  }
+  #insts .line {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 8px;
+  }
+  #insts .left {
+    width: fit-content;
+    display: flex;
+    gap: 4px;
+  }
+  #insts .left.highlight {
+    background-color: rgba(0, 199, 47, 0.2);
+  }
+  #insts .pc {
+    color: #73daca;
+  }
+  g.node.highlight rect.node, .edgePath.highlight, g.port circle {
     stroke: #89C9A2;
   }
-  g.highlight.child rect, .edgePath.highlight.child {
+  g.highlight.child rect.node, .edgePath.highlight.child {
     stroke: #C888B0;
   }
   #edge-labels g.port.highlight {
@@ -323,14 +353,6 @@
   td.Instruction {
     font-family: monospace;
   }
-  td.pct-row > div {
-    height: 12px;
-    width: 100%;
-    display: flex;
-  }
-  td.pct-row > div > div {
-    height: 100%;
-  }
   thead {
     position: sticky;
     top: 0;
@@ -351,12 +373,11 @@
   tr.nested-row table tr.main-row:hover {
     background-color: unset;
   }
-  tr.main-row.has-children > td:first-child {
-    white-space: pre;
+  tr.main-row.has-children > td:first-child > p {
+    display: inline-block;
   }
   tr.main-row.has-children > td:first-child::before {
     content: "▸ ";
-    display: inline-block;
     width: 1em;
     margin-left: -0.25em;
   }

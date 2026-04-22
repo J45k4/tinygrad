@@ -3,7 +3,7 @@ import functools
 from typing import Callable
 from dataclasses import dataclass
 from tinygrad.dtype import AddrSpace, DType
-from tinygrad.mixin import MathMixin
+from tinygrad.mixin import ElementwiseMixin
 from tinygrad.uop.ops import UOp, Ops
 
 from extra.thunder.tiny.tk import WARP_THREADS
@@ -36,7 +36,7 @@ def autowrap(source_cls, blacklist=None):
         def proxy(*args, **kwargs):
           return wrap(val(*unwrap(args), **unwrap(kwargs)), self)
         return proxy
-      if name in UOp.__slots__: return val
+      if name in UOp.__slots__: return val # type: ignore
       return wrap(val, self)
     cls.__getattr__ = __getattr__
 
@@ -58,7 +58,7 @@ def autowrap(source_cls, blacklist=None):
     return cls
   return decorator
 
-class TileMathMixin(MathMixin):
+class TileMathMixin(ElementwiseMixin):
   def alu(self, op, *src, inner_op=lambda x:x):
     assert isinstance(self, (RT, RV))
     if len(src) == 0:
@@ -77,6 +77,10 @@ class TileMathMixin(MathMixin):
     else: raise NotImplementedError
     return self.ruop(uop)
   def const_like(self, b): return b
+
+  @property
+  def dtype(self): return self._uop.dtype
+  def cast(self, dtype:DType): return self.ruop(self._uop.cast(dtype))
 
   # override ops that do compute on the src uop
   def sub(self, x, reverse=False):
@@ -250,11 +254,12 @@ class RT(TileMathMixin):
 
 @autowrap(UOp)
 class RV(TileMathMixin):
-  def __init__(self, uop:UOp, layout:VecLayout, ker):
-    self._uop, self.layout, self.ker = uop, layout, ker
+  def __init__(self, uop:UOp, length:int, layout:VecLayout, base_shape:RTBaseShape, ker):
+    self._uop, self.ker = uop, ker
+    self.length, self.layout, self.base_shape = length, layout, base_shape
 
   def ruop(self, uop:UOp):
-    return RV(uop, self.layout, self.ker)
+    return RV(uop, self.length, self.layout, self.base_shape, self.ker)
 
   @classmethod
   def create(cls, length, dtype:DType, layout:VecLayout, base_shape:RTBaseShape, ker):
@@ -266,6 +271,6 @@ class RV(TileMathMixin):
         outer_dim = tiles
 
     uop = ker.alloc((outer_dim, inner_dim), dtype, AddrSpace.REG)
-    return RV(uop, layout, ker)
+    return RV(uop, length, layout, base_shape, ker)
 
 ALL_TILES = UOp | GL | ST | RT | RV
